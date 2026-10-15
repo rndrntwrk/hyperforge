@@ -17,6 +17,14 @@ import type {
   NPCDialogueNode,
 } from "../../../types/entities/npc-mob-types";
 import { isValidQuestId } from "../../../types/game/quest-types";
+import { NPCEntity } from "../../../entities/npc/NPCEntity";
+import { PlayerEntity } from "../../../entities/player/PlayerEntity";
+import type { PlayerSystem } from "../character/PlayerSystem";
+import type { PrayerSystem } from "../character/PrayerSystem";
+import type { DuelSystem } from "../../../types/systems/system-interfaces";
+import type { ISessionReader } from "../../../types/interaction";
+import { INTERACTION_DISTANCE } from "../../../constants/interaction";
+import { canRestoreAtArenaNurse } from "./arenaNursePolicy";
 
 interface DialogueState {
   npcId: string;
@@ -441,6 +449,13 @@ export class DialogueSystem extends SystemBase {
     const [effectName, ...params] = effect.split(":");
 
     switch (effectName) {
+      case "restoreArenaHealth":
+        // No amounts or target IDs are accepted from the effect/client.
+        if (params.length === 0) {
+          this.restoreAtArenaNurse(playerId, npcId, npcEntityId);
+        }
+        break;
+
       case "openBank":
         this.emitTypedEvent(EventType.BANK_OPEN_REQUEST, {
           playerId,
@@ -531,6 +546,88 @@ export class DialogueSystem extends SystemBase {
       default:
         this.logger.warn(`Unknown dialogue effect: ${effectName}`);
     }
+  }
+
+  /** Restore only through a live, server-owned nurse dialogue/session. */
+  private restoreAtArenaNurse(
+    playerId: string,
+    npcId: string,
+    npcEntityId?: string,
+  ): void {
+    if (!this.world.isServer || !npcEntityId) return;
+
+    const state = this.activeDialogues.get(playerId);
+    const sessionReader = (
+      this.world as World & { interactionSessionManager?: ISessionReader }
+    ).interactionSessionManager;
+    const session = sessionReader?.getSession(playerId);
+    const npc = this.world.entities.get(npcEntityId);
+    const player = this.world.getPlayer(playerId);
+    const players = this.world.getSystem<PlayerSystem>("player");
+    const prayer = this.world.getSystem<PrayerSystem>("prayer");
+    const duel = this.world.getSystem<DuelSystem>("duel");
+
+    // Missing authority is a denial, including a missing duel system.
+    if (
+      !state ||
+      !session ||
+      !(npc instanceof NPCEntity) ||
+      !(player instanceof PlayerEntity) ||
+      !players ||
+      !prayer ||
+      !duel ||
+      !this.world.getPlayerSocket(playerId)
+    )
+      return;
+
+    if (
+      !canRestoreAtArenaNurse({
+        npcId,
+        liveNpcId: npc.config.npcId,
+        entityId: npcEntityId,
+        dialogueNpcId: state.npcId,
+        dialogueEntityId: state.npcEntityId,
+        sessionPlayerId: session.playerId,
+        playerId,
+        sessionType: session.sessionType,
+        sessionEntityId: session.targetEntityId,
+        alive:
+          player.isAlive() &&
+          !player.isDeadOrDying() &&
+          players.isPlayerAlive(playerId),
+        inDuel: duel.isPlayerInDuel(playerId),
+        playerPosition: player.position,
+        npcPosition: npc.position,
+        maxDistance: INTERACTION_DISTANCE.dialogue,
+      })
+    )
+      return;
+
+    const health = players.getPlayerHealth(playerId);
+    const maxPrayer = prayer.getMaxPrayerPoints(playerId);
+    const entityMaxHealth = player.getMaxHealth();
+    if (
+      !health ||
+      !prayer.getPrayerState(playerId) ||
+      !Number.isFinite(player.getHealth()) ||
+      !Number.isFinite(health.current) ||
+      health.current <= 0 ||
+      !Number.isFinite(entityMaxHealth) ||
+      entityMaxHealth !== health.max ||
+      !Number.isFinite(health.max) ||
+      health.max <= 0 ||
+      !Number.isFinite(maxPrayer) ||
+      maxPrayer <= 0
+    )
+      return;
+
+    // Consume before emitting health/prayer events, preventing reentrant replay.
+    this.activeDialogues.delete(playerId);
+    // Combat reads entity health; PlayerSystem maintains a separate health pool.
+    // Their maxima must agree before either pool is changed.
+    player.setHealth(entityMaxHealth);
+    players.healPlayer(playerId, health.max);
+    prayer.restorePrayerPoints(playerId, maxPrayer);
   }
 
   /**
