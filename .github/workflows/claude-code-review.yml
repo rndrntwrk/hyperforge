@@ -12,6 +12,8 @@ on:
 
 jobs:
   claude-review:
+    # Paid review is opt-in for forks; preserve the upstream owner's behavior.
+    if: github.repository_owner == 'PlayHyperia'
     # Optional: Filter by PR author
     # if: |
     #   github.event.pull_request.user.login == 'external-contributor' ||
